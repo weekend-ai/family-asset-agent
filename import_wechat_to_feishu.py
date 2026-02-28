@@ -6,6 +6,7 @@
 #     "openpyxl",
 #     "openai",
 #     "python-dotenv",
+#     "httpx[socks]",
 # ]
 # ///
 
@@ -13,6 +14,7 @@ import os
 import re
 import time
 import json
+import traceback
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -40,7 +42,8 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
 
 # Behavior
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y")
+# DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y")
+DRY_RUN = False
 
 DEFAULT_OWNER = os.getenv("DEFAULT_OWNER", "共同")
 DEFAULT_CHANNEL = os.getenv("DEFAULT_CHANNEL", "微信")
@@ -97,7 +100,6 @@ def normalize_direction(x: Any) -> str:
     return s or "支出"
 
 def month_str(dt: pd.Timestamp) -> str:
-    # Feishu formula field Month exists, but we also fill it for convenience.
     return dt.strftime("%Y-%m")
 
 # ----------------------------
@@ -127,6 +129,8 @@ def chunks(xs: List[Any], n: int):
 # ----------------------------
 # Category model
 # ----------------------------
+L1_CANDIDATES = ["生存成本", "生活运营", "旅行", "升级消费", "投资", "收入", "其他"]
+
 L2_CANDIDATES = [
     # 生存成本
     "居住-房租", "居住-水电网", "通讯订阅-手机网费", "通讯订阅-软件订阅", "保险", "宠物-基础", "宠物-医疗",
@@ -142,57 +146,101 @@ L2_CANDIDATES = [
     "其他",
 ]
 
-def l1_from_l2(l2: str) -> str:
-    if l2 in {"居住-房租","居住-水电网","通讯订阅-手机网费","通讯订阅-软件订阅","保险","宠物-基础","宠物-医疗"}:
-        return "生存成本"
-    if l2 in {"餐饮-外食","餐饮-外卖咖啡","超市-食材","日用品","交通-打车公交","社交-聚会请客"}:
-        return "生活运营"
-    if l2.startswith("旅行-"):
-        return "旅行"
-    if l2 in {"数码设备","家具家电","运动/摄影装备","高端体验"}:
-        return "升级消费"
-    if l2 in {"定投/入金","保险理财"}:
-        return "投资"
-    if l2 in {"工资","奖金","股票/期权","投资收益"}:
-        return "收入"
-    return "其他"
+L1_L2_MAP = {
+    "生存成本": ["居住-房租", "居住-水电网", "通讯订阅-手机网费", "通讯订阅-软件订阅", "保险", "宠物-基础", "宠物-医疗"],
+    "生活运营": ["餐饮-外食", "餐饮-外卖咖啡", "超市-食材", "日用品", "交通-打车公交", "社交-聚会请客"],
+    "旅行":     ["旅行-预提", "旅行-机酒", "旅行-当地交通", "旅行-餐饮门票"],
+    "升级消费": ["数码设备", "家具家电", "运动/摄影装备", "高端体验"],
+    "投资":     ["定投/入金", "保险理财"],
+    "收入":     ["工资", "奖金", "股票/期权", "投资收益"],
+    "其他":     ["其他"],
+}
 
-def classify_l2(merchant: str, desc: str, direction: str, tx_type: str = "") -> str:
+_llm_client: Optional[AzureOpenAI] = None
 
-    prompt = f"""你是家庭记账分类器。根据"交易对方/商品描述/交易类型"把交易归入二级分类 L2。
-候选 L2：
-{", ".join(L2_CANDIDATES)}
-
-交易类型：{tx_type}
-交易对方：{merchant}
-商品/描述：{desc}
-收支方向：{direction}
-
-要求：
-- 只输出一个 L2，必须来自候选列表
-- 不要输出解释
-"""
-    try:
-        client = AzureOpenAI(
+def get_llm_client() -> AzureOpenAI:
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = AzureOpenAI(
             api_key=AZURE_OPENAI_API_KEY,
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_version=AZURE_OPENAI_API_VERSION,
         )
+    return _llm_client
+
+def classify_transaction(merchant: str, desc: str, direction: str, tx_type: str = "") -> Dict[str, Any]:
+    """Use LLM to classify a single transaction row into Feishu fields."""
+
+    default = {
+        "L1": "其他",
+        "L2": "其他",
+        "IsFixed": "非固定",
+        "IsNecessary": "非必要",
+        "ExcludeFromBudget": direction == "转账",
+    }
+
+    if not (AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT):
+        return default
+
+    l1_l2_desc = "\n".join(f"  {l1}: {', '.join(l2s)}" for l1, l2s in L1_L2_MAP.items())
+
+    prompt = f"""你是家庭记账分类器。根据下面一条微信交易记录，输出 JSON 填充飞书多维表格的字段。
+
+--- 交易信息 ---
+交易类型: {tx_type}
+交易对方: {merchant}
+商品/描述: {desc}
+收支方向: {direction}
+
+--- 需要你填写的字段 ---
+1. L1 (一级分类): 必须是以下之一: {", ".join(L1_CANDIDATES)}
+2. L2 (二级分类): 必须是以下之一，且与 L1 对应:
+{l1_l2_desc}
+3. IsFixed (是否固定支出): "固定" 或 "非固定"
+   - 固定: 每月必然发生且金额相对稳定 (房租、水电、订阅、保险等)
+   - 非固定: 偶发或金额波动大
+4. IsNecessary (是否必要支出): "必要" 或 "非必要"
+   - 必要: 维持基本生活必须 (居住、基本餐饮、交通通勤、保险等)
+   - 非必要: 可削减的消费 (外卖咖啡、社交聚会、高端体验等)
+5. ExcludeFromBudget (是否排除预算): true 或 false
+   - true: 转账、退款、内部划转等不计入收支预算
+   - false: 正常收支
+
+--- 要求 ---
+- 只输出合法 JSON，不要输出任何解释
+- JSON 格式: {{"L1": "...", "L2": "...", "IsFixed": "...", "IsNecessary": "...", "ExcludeFromBudget": true/false}}
+"""
+    try:
+        client = get_llm_client()
         resp = client.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=[
-                {"role": "system", "content": "Return only one label from the candidate list."},
+                {"role": "system", "content": "You are a JSON-only responder. Output valid JSON and nothing else."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
+            response_format={"type": "json_object"},
         )
-        label = (resp.choices[0].message.content or "").strip()
-        if label in L2_CANDIDATES:
-            return label
-    except Exception:
-        pass
+        raw = (resp.choices[0].message.content or "").strip()
+        result = json.loads(raw)
 
-    return "其他"
+        # Validate and fallback for each field
+        if result.get("L2") not in L2_CANDIDATES:
+            result["L2"] = "其他"
+        if result.get("L1") not in L1_CANDIDATES:
+            result["L1"] = "其他"
+        if result.get("IsFixed") not in ("固定", "非固定"):
+            result["IsFixed"] = "非固定"
+        if result.get("IsNecessary") not in ("必要", "非必要"):
+            result["IsNecessary"] = "非必要"
+        if not isinstance(result.get("ExcludeFromBudget"), bool):
+            result["ExcludeFromBudget"] = direction == "转账"
+
+        return result
+    except Exception:
+        traceback.print_exc()
+
+    return default
 
 # ----------------------------
 # Parse WeChat exported files
@@ -214,13 +262,41 @@ def load_file(path: str) -> pd.DataFrame:
             return pd.read_csv(path, dtype=str, encoding="utf-8")
         except UnicodeDecodeError:
             return pd.read_csv(path, dtype=str, encoding="gbk")
-    return pd.read_excel(path, dtype=str)
+
+    # WeChat export files have metadata rows at the top
+    # Find the row containing "微信支付账单明细列表"
+    df_raw = pd.read_excel(path, header=None)
+    header_row = None
+
+    for idx, row in df_raw.iterrows():
+        if row.astype(str).str.contains("微信支付账单明细列表", na=False).any():
+            # The actual header is one row below this marker
+            header_row = idx + 1
+            break
+
+    if header_row is None:
+        raise RuntimeError(
+            "Could not find WeChat export header marker. "
+            "Is this a valid WeChat export file?"
+        )
+
+    # Re-read with the correct header row
+    return pd.read_excel(path, dtype=str, skiprows=header_row, header=0)
 
 def prepare_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    # Debug: show what columns we found
+    print(f"Columns in file: {df.columns.tolist()}")
+
     # Keep only known columns
     cols = [c for c in WECHAT_MAP.keys() if c in df.columns]
+    print(f"Matched columns: {cols}")
+
+    if not cols:
+        raise RuntimeError(f"No matching columns found. Expected: {list(WECHAT_MAP.keys())}")
+
     df = df[cols].copy()
     df.rename(columns={k: v for k, v in WECHAT_MAP.items()}, inplace=True)
+    print(f"Columns after rename: {df.columns.tolist()}")
 
     # Normalize
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -232,8 +308,9 @@ def prepare_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     df["Note"] = df.get("Note", "").apply(safe_text)
     df["TxType"] = df.get("TxType", "").apply(safe_text)
 
+    total = len(df)
     out: List[Dict[str, Any]] = []
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows()):
         if pd.isna(row["Date"]):
             continue
 
@@ -244,29 +321,27 @@ def prepare_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
         desc = row["Description"]
         tx_type = row["TxType"]
 
-        # Guess L2/L1
-        l2 = classify_l2(merchant, desc, direction, tx_type=tx_type)
-
-        # If it's a transfer, exclude by default (you can change this policy)
-        exclude = True if direction == "转账" else False
+        # LLM classifies all judgment fields for this row
+        print(f"[{i+1}/{total}] Classifying: {merchant} | {desc} | {direction}")
+        classification = classify_transaction(merchant, desc, direction, tx_type=tx_type)
+        print(f"  -> {classification}")
 
         fields = {
-            FIELDS["Date"]: dt.strftime("%Y-%m-%d %H:%M:%S"),
+            FIELDS["Date"]: int(dt.timestamp() * 1000),
             FIELDS["Amount"]: amount,
             FIELDS["Direction"]: direction,
             FIELDS["Merchant"]: merchant,
             FIELDS["Description"]: desc,
             FIELDS["Channel"]: row["Channel"] or DEFAULT_CHANNEL,
             FIELDS["Owner"]: DEFAULT_OWNER,
-            FIELDS["L2"]: l2,
+            FIELDS["L1"]: classification["L1"],
+            FIELDS["L2"]: classification["L2"],
+            FIELDS["IsFixed"]: classification["IsFixed"],
+            FIELDS["IsNecessary"]: classification["IsNecessary"],
+            FIELDS["Month"]: month_str(dt),
             FIELDS["Note"]: row["Note"],
-            FIELDS["ExcludeFromBudget"]: exclude,
+            FIELDS["ExcludeFromBudget"]: classification["ExcludeFromBudget"],
         }
-
-        # Optional: fill these if your Feishu columns are single-select and already have options
-        # If not set up yet, better leave them blank to avoid write errors.
-        # fields[FIELDS["IsFixed"]] = "固定"
-        # fields[FIELDS["IsNecessary"]] = "必要"
 
         out.append(fields)
 
@@ -290,7 +365,7 @@ def main():
     records = prepare_records(df)
 
     print(f"Prepared {len(records)} records.")
-    print(json.dumps(records[:5], ensure_ascii=False, indent=2))
+    print(json.dumps(records[:3], ensure_ascii=False, indent=2))
 
     if DRY_RUN:
         print("DRY_RUN=true: not writing to Feishu.")
