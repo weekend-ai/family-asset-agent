@@ -1,0 +1,17 @@
+{
+  "base_token": "",
+  "tables": {
+    "transactions": "",
+    "overview": "",
+    "private_account": ""
+  },
+  "table_names": {
+    "transactions": "Transaction",
+    "overview": "家庭汇总",
+    "private_account": "私人账户"
+  },
+  "owners": ["成员A", "成员B", "共同"],
+  "owner_aliases": {
+    "账单中的姓名": "成员A"
+  }
+}
